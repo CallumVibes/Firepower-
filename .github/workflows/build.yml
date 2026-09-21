@@ -123,7 +123,9 @@ jobs:
           PKGS="com.amazon.device.crashmanager
           com.amazon.logan
           com.amazon.hedwig
-          com.amazon.bueller.photos"
+          com.amazon.bueller.photos
+          com.amazon.shoptv.firetv.client
+          com.amazon.alexamediaplayer.runtime.ftv"
 
           # Read-only: shown in status so you can confirm your update block is intact
           OTA_WATCH="com.amazon.device.software.ota
@@ -139,7 +141,7 @@ jobs:
             elif disabled "$1"; then echo "disabled"
             else echo "enabled"; fi
           }
-          wifi_line() { dumpsys wifi | grep -m1 'mWifiInfo' | sed 's/[TR]x Link speed/xLink/g'; }
+          wifi_line() { dumpsys wifi 2>/dev/null | grep -m1 'mWifiInfo' | sed 's/[TR]x Link speed/xLink/g'; }
 
           status() {
             echo "== Update block (never changed by this script) =="
@@ -164,6 +166,8 @@ jobs:
               com.amazon.logan) echo "Usage logging" ;;
               com.amazon.hedwig) echo "Push notifications" ;;
               com.amazon.bueller.photos) echo "Amazon Photos" ;;
+              com.amazon.shoptv.firetv.client) echo "Live Shopping" ;;
+              com.amazon.alexamediaplayer.runtime.ftv) echo "Alexa Media Player" ;;
               *) echo "$1" ;;
             esac
           }
@@ -275,7 +279,7 @@ jobs:
               [ -n "$a" ] && echo "$i: ${a#inet }"
             done
             echo "== DNS servers (should be your Pi-hole's IP) =="
-            dumpsys connectivity | grep -o 'DnsAddresses: \[[^]]*\]' | sort -u
+            dumpsys connectivity 2>/dev/null | grep -o 'DnsAddresses: \[[^]]*\]' | sort -u
             echo "== Private DNS (should be off or null, or Pi-hole is bypassed) =="
             settings get global private_dns_mode
             echo "== Wi-Fi =="
@@ -285,7 +289,7 @@ jobs:
 
           hogs() {
             echo "== Top memory users =="
-            dumpsys meminfo | sed -n '/Total PSS by process/,/^$/p' | head -16
+            dumpsys meminfo 2>/dev/null | sed -n '/Total PSS by process/,/^$/p' | head -16
           }
 
           diagnose() {
