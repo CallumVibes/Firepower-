@@ -73,6 +73,7 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
               <uses-feature android:name="android.software.leanback" android:required="false" />
               <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
               <application
@@ -347,6 +348,129 @@ jobs:
             echo "Logging started. Go and watch something."
           }
 
+          # ---- Uninstaller: only apps YOU installed (never system apps) ----
+          userapps() { pm list packages -3 2>/dev/null | sed 's/^package://' | sort; }
+
+          uninstall_app() {
+            p="$1"
+            case "$p" in ""|*[!A-Za-z0-9._]*) echo "Refused: invalid app name."; return 1 ;; esac
+            if [ "$p" = "com.cf.firepower" ]; then
+              echo "Refused: remove FirePower from Settings > Applications instead."; return 1
+            fi
+            if ! pm list packages -3 2>/dev/null | grep -qx "package:$p"; then
+              echo "Refused: $p is not an app you installed."; return 1
+            fi
+            if pm uninstall "$p" 2>&1 | grep -q Success; then
+              echo "Uninstalled: $p"
+            else
+              echo "Could not uninstall: $p"
+            fi
+          }
+
+          # ---- Downloads cleaner: files in the Download folder only ----
+          downloads() {
+            for f in /sdcard/Download/*; do
+              [ -f "$f" ] || continue
+              echo "$(du -k "$f" | cut -f1)|$f"
+            done
+          }
+
+          delfile() {
+            f="$1"
+            case "$f" in /sdcard/Download/*) ;; *) echo "Refused: only files in the Download folder."; return 1 ;; esac
+            case "$f" in */../*|*/..|*/./*) echo "Refused."; return 1 ;; esac
+            rest=${f#/sdcard/Download/}
+            case "$rest" in */*) echo "Refused: only files directly in Download."; return 1 ;; esac
+            [ -f "$f" ] || { echo "Not found: ${f##*/}"; return 1; }
+            rm -f "$f" && echo "Deleted: ${f##*/}"
+          }
+
+          # ---- Junk cleaner: scan first, only known-safe categories ----
+          sizek() { s=$(du -sk "$1" 2>/dev/null | cut -f1); echo "${s:-0}"; }
+
+          cache_dirs() {
+            for d in /sdcard/Android/data/*/cache; do [ -d "$d" ] && echo "$d"; done
+          }
+
+          # Folders in Android/data and Android/obb whose app is completely unknown
+          # to the system. Uses -u so apps removed with "keep data" are NOT treated as junk.
+          orphan_dirs() {
+            known=$(pm list packages -u 2>/dev/null | sed 's/^package://')
+            n=$(echo "$known" | grep -c .)
+            if [ "$n" -lt 20 ]; then echo "ERR"; return 1; fi
+            for base in /sdcard/Android/data /sdcard/Android/obb; do
+              for d in "$base"/*; do
+                [ -d "$d" ] || continue
+                p=${d##*/}
+                case "$p" in ""|*[!A-Za-z0-9._]*) continue ;; esac
+                echo "$known" | grep -qx "$p" || echo "$d"
+              done
+            done
+          }
+
+          apk_files() {
+            for f in /sdcard/Download/*.apk /sdcard/Download/*.APK; do [ -f "$f" ] && echo "$f"; done
+          }
+
+          log_files() {
+            pgrep -f 'firepower_diag.sh diagnose' >/dev/null 2>&1 && return 0
+            for f in "$DIAG" "$DIAG_SH"; do [ -f "$f" ] && echo "$f"; done
+          }
+
+          sum_paths() {
+            t=0; c=0
+            while IFS= read -r x; do
+              [ -n "$x" ] || continue
+              t=$((t + $(sizek "$x"))); c=$((c + 1))
+            done
+            echo "$t|$c"
+          }
+
+          # Machine-readable: category|kb|count  (+ orphan|kb|path detail lines)
+          junkscan() {
+            echo "cache|$(cache_dirs | sum_paths)"
+            o=$(orphan_dirs)
+            if [ "$o" = "ERR" ]; then
+              echo "orphans_error|0|0"
+            else
+              echo "orphans|$(echo "$o" | sum_paths)"
+              echo "$o" | while IFS= read -r d; do [ -n "$d" ] && echo "orphan|$(sizek "$d")|$d"; done
+            fi
+            echo "apks|$(apk_files | sum_paths)"
+            echo "logs|$(log_files | sum_paths)"
+          }
+
+          junkclean() {
+            before=$(df /data 2>/dev/null | tail -1 | sed 's/  */ /g' | cut -d' ' -f4)
+            for cat in "$@"; do
+              case "$cat" in
+                cache)
+                  cache_dirs | while IFS= read -r d; do
+                    case "$d" in /sdcard/Android/data/*/cache) rm -rf "$d"/* "$d"/.[!.]* 2>/dev/null ;; esac
+                  done
+                  echo "Cleared app caches." ;;
+                orphans)
+                  o=$(orphan_dirs)
+                  if [ "$o" = "ERR" ]; then echo "Skipped leftovers: couldn't read the app list safely."; continue; fi
+                  echo "$o" | while IFS= read -r d; do
+                    case "$d" in
+                      /sdcard/Android/data/?*|/sdcard/Android/obb/?*) rm -rf "$d" && echo "  removed ${d#/sdcard/}" ;;
+                    esac
+                  done
+                  echo "Removed leftovers from uninstalled apps." ;;
+                apks)
+                  apk_files | while IFS= read -r f; do rm -f "$f" && echo "  deleted ${f##*/}"; done
+                  echo "Deleted install files." ;;
+                logs)
+                  log_files | while IFS= read -r f; do rm -f "$f"; done
+                  echo "Deleted FirePower logs." ;;
+                *) echo "Unknown category: $cat" ;;
+              esac
+            done
+            after=$(df /data 2>/dev/null | tail -1 | sed 's/  */ /g' | cut -d' ' -f4)
+            echo "Storage free: $before -> $after"
+          }
+
           case "${1:-status}" in
             status)   status ;;
             quick|boost) quick ;;
@@ -358,6 +482,12 @@ jobs:
             hogs)     hogs ;;
             diagnose) diagnose "$2" ;;
             summary)  summary ;;
+            userapps) userapps ;;
+            uninstall_app) uninstall_app "$2" ;;
+            downloads) downloads ;;
+            delfile)  delfile "$2" ;;
+            junkscan) junkscan ;;
+            junkclean) shift; junkclean "$@" ;;
             startdiag) startdiag "$2" ;;
             stopdiag) stopdiag ;;
             *) echo "Usage: sh firepower.sh [status|quick|clutter|declutter PKG|undeclutter PKG|restore|net|hogs|diagnose N|startdiag N|stopdiag|summary]" ;;
@@ -369,6 +499,7 @@ jobs:
 
           import android.app.Activity
           import android.app.AlertDialog
+          import android.content.Intent
           import android.content.res.ColorStateList
           import android.graphics.Color
           import android.graphics.Typeface
@@ -517,6 +648,9 @@ jobs:
                   }
                   action(actions, "Start diagnose", "Log for 10 minutes while you watch") { confirmDiagnose() }
                   action(actions, "Diagnose results", "Find what caused the buffering") { diagnoseResults() }
+                  action(actions, "Uninstall apps", "Remove apps you installed, biggest first") { uninstallMenu() }
+                  action(actions, "Clean downloads", "Delete leftover files in Download") { downloadsMenu() }
+                  action(actions, "Clean junk", "Scan caches and leftovers, then choose") { junkMenu() }
                   action(actions, "Refresh status", "Re-read the tiles") { refresh() }
 
                   val actionScroll = ScrollView(this).apply { addView(actions) }
@@ -764,6 +898,163 @@ jobs:
               private fun diagnoseResults() {
                   exec("Diagnose results", "cat $diagFile 2>/dev/null", quiet = true) { out ->
                       log("\n> Diagnose results\n" + analyse(out))
+                  }
+              }
+
+              // ---------- Uninstaller ----------
+
+              private fun humanKb(kb: Long): String = when {
+                  kb >= 1024L * 1024L -> String.format("%.1f GB", kb / 1048576.0)
+                  kb >= 1024L -> "" + (kb / 1024L) + " MB"
+                  else -> "" + kb + " KB"
+              }
+
+              private fun appLabel(pkg: String): String = try {
+                  packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+              } catch (e: Exception) {
+                  pkg
+              }
+
+              private fun homePackage(): String? = try {
+                  val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+                  packageManager.resolveActivity(i, 0)?.activityInfo?.packageName
+              } catch (e: Exception) {
+                  null
+              }
+
+              private fun parseList(line: String?): List<String> {
+                  if (line == null) return emptyList()
+                  val inside = line.substringAfter("[", "").substringBeforeLast("]", "")
+                  if (inside.isBlank()) return emptyList()
+                  return inside.split(",").map { it.trim().trim('"') }
+              }
+
+              private fun uninstallMenu() {
+                  val cmd = "sh $remote userapps; echo ---; dumpsys diskstats 2>/dev/null | grep -E '^(Package Names|App Sizes|App Data Sizes):'"
+                  exec("Uninstall apps", cmd, quiet = true) { out ->
+                      val parts = out.split("---")
+                      val pkgs = parts[0].lines().map { it.trim() }.filter { it.isNotEmpty() && it != packageName }
+                      val stats = parts.getOrElse(1) { "" }.lines().map { it.trim() }
+                      val names = parseList(stats.firstOrNull { it.startsWith("Package Names:") })
+                      val appSizes = parseList(stats.firstOrNull { it.startsWith("App Sizes:") })
+                      val dataSizes = parseList(stats.firstOrNull { it.startsWith("App Data Sizes:") })
+                      val sizes = HashMap<String, Long>()
+                      names.forEachIndexed { i, n ->
+                          val bytes = (appSizes.getOrNull(i)?.toLongOrNull() ?: 0L) + (dataSizes.getOrNull(i)?.toLongOrNull() ?: 0L)
+                          if (bytes > 0) sizes[n] = bytes / 1024L
+                      }
+                      if (pkgs.isEmpty()) {
+                          log("No apps you installed were found.")
+                      } else {
+                          val rows = pkgs.map { Triple(it, appLabel(it), sizes[it]) }
+                              .sortedByDescending { it.third ?: -1L }
+                          val labels = rows.map { r ->
+                              r.second + " — " + (r.third?.let { humanKb(it) } ?: "size unknown")
+                          }.toTypedArray()
+                          AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                              .setTitle("Uninstall apps (sizes approx.)")
+                              .setItems(labels) { _, which -> pickUninstall(rows[which].first, rows[which].second) }
+                              .setNegativeButton("Close", null)
+                              .show()
+                      }
+                  }
+              }
+
+              private fun pickUninstall(pkg: String, name: String) {
+                  val warn = if (pkg == homePackage()) {
+                      "\n\nThis is your home screen launcher. The stick will go back to Amazon's home screen."
+                  } else ""
+                  confirm(
+                      "Uninstall $name?",
+                      "Removes $name ($pkg) and all its data, including logins and settings. " +
+                          "You'd need to reinstall it to get it back." + warn
+                  ) {
+                      exec("Uninstall $name", "sh $remote uninstall_app $pkg") { refresh() }
+                  }
+              }
+
+              private fun shQuote(s: String): String = "'" + s.replace("'", "'\\''") + "'"
+
+              private fun downloadsMenu() {
+                  exec("Clean downloads", "sh $remote downloads", quiet = true) { out ->
+                      val files = out.lines().mapNotNull { l ->
+                          val i = l.indexOf('|')
+                          if (i > 0) Pair(l.substring(i + 1).trim(), l.substring(0, i).trim().toLongOrNull() ?: 0L) else null
+                      }.sortedByDescending { it.second }
+                      if (files.isEmpty()) {
+                          log("The Download folder is empty.")
+                      } else {
+                          val total = files.sumOf { it.second }
+                          val labels = files.map { it.first.substringAfterLast('/') + " — " + humanKb(it.second) }.toTypedArray()
+                          AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                              .setTitle("Download folder — " + humanKb(total) + " total")
+                              .setItems(labels) { _, which -> pickFile(files[which]) }
+                              .setNegativeButton("Close", null)
+                              .show()
+                      }
+                  }
+              }
+
+              private fun pickFile(f: Pair<String, Long>) {
+                  val name = f.first.substringAfterLast('/')
+                  confirm("Delete $name?", "Deletes " + humanKb(f.second) + " from the Download folder. This can't be undone.") {
+                      exec("Delete $name", "sh $remote delfile " + shQuote(f.first)) { refresh() }
+                  }
+              }
+
+              // ---------- Junk cleaner ----------
+
+              private fun junkMenu() {
+                  exec("Clean junk", "sh $remote junkscan", quiet = true) { out ->
+                      val keys = ArrayList<String>()
+                      val labels = ArrayList<String>()
+                      val orphanNames = ArrayList<String>()
+                      var orphanError = false
+                      for (line in out.lines()) {
+                          val p = line.trim().split("|")
+                          if (p.size < 3) continue
+                          val kb = p[1].toLongOrNull() ?: 0L
+                          val count = p[2]
+                          when (p[0]) {
+                              "orphan" -> orphanNames.add(p[2].substringAfterLast('/') + " (" + humanKb(kb) + ")")
+                              "orphans_error" -> orphanError = true
+                              "cache", "orphans", "apks", "logs" -> if (kb > 0) {
+                                  keys.add(p[0])
+                                  labels.add(when (p[0]) {
+                                      "cache" -> "App caches — " + humanKb(kb) + " (" + count + " apps)"
+                                      "orphans" -> "Leftovers from uninstalled apps — " + humanKb(kb) + " (" + count + ")"
+                                      "apks" -> "Install files (.apk) in Download — " + humanKb(kb) + " (" + count + ")"
+                                      else -> "FirePower's diagnose logs — " + humanKb(kb)
+                                  })
+                              }
+                          }
+                      }
+                      if (orphanError) log("Skipped leftover check: couldn't read the app list safely.")
+                      if (keys.isEmpty()) {
+                          log("No junk found. Nice and tidy.")
+                      } else {
+                          val checked = BooleanArray(keys.size) { keys[it] != "apks" }
+                          AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                              .setTitle("Junk found — tick what to clean")
+                              .setMultiChoiceItems(labels.toTypedArray(), checked) { _, which, isChecked -> checked[which] = isChecked }
+                              .setPositiveButton("Clean") { _, _ ->
+                                  val chosen = keys.filterIndexed { i, _ -> checked[i] }
+                                  if (chosen.isEmpty()) {
+                                      log("Nothing selected.")
+                                  } else {
+                                      var msg = "This deletes:\n• " + labels.filterIndexed { i, _ -> checked[i] }.joinToString("\n• ")
+                                      if ("orphans" in chosen && orphanNames.isNotEmpty()) {
+                                          msg += "\n\nLeftover folders:\n" + orphanNames.take(10).joinToString("\n")
+                                      }
+                                      msg += "\n\nBest done when nothing is playing. Caches rebuild automatically."
+                                      confirm("Clean junk?", msg) {
+                                          exec("Clean junk", "sh $remote junkclean " + chosen.joinToString(" ")) { refresh() }
+                                      }
+                                  }
+                              }
+                              .setNegativeButton("Close", null)
+                              .show()
+                      }
                   }
               }
 
